@@ -1,0 +1,328 @@
+var dbManager = require('./dbManager');
+var requestIp = require('request-ip');
+var DB = dbManager.pool;
+const axios = require('axios');
+const { request, response } = require('express');
+var jwt = require('jsonwebtoken');
+var bkfd2Password = require("pbkdf2-password");
+var hasher = bkfd2Password();
+
+function getMemberInfo(memberId) {
+    return new Promise((resolve,reject) =>{
+        DB.query('SELECT * FROM member WHERE memberId = \'' + memberId + '\'',
+            function(err, result) {
+                if (err) {
+                    console.error(err);
+                    reject(err)
+                        response.send({ "status": "404" })
+                } else {
+                    if(result.length > 0){
+                        resolve(result);
+                    }else{
+                        reject(err)
+                        response.send({ "status": "404" })
+                    }
+                    
+                }
+            }
+        )
+    })
+}
+
+function getAdminMemberInfo(memberId) {
+    return new Promise((resolve,reject) =>{
+        DB.query('SELECT * FROM adminMember WHERE memberId = \'' + memberId + '\'',
+            function(err, result) {
+                if (err) {
+                    console.error(err);
+                    reject(err)
+                        response.send({ "status": "404" })
+                } else {
+                    if(result.length > 0){
+                        resolve(result);
+                    }else{
+                        reject(err)
+                        response.send({ "status": "404" })
+                    }
+                    
+                }
+            }
+        )
+    })
+}
+
+
+function dbQuery(query,data) {
+    return new Promise((resolve,reject)=>{
+    DB.query(query,data,function(err, result) {
+        if (err) {
+                console.error(err);
+                reject(err)
+                response.send({ "status": "404" })
+            } else {
+                resolve(result);
+            }
+        }
+    )
+})
+}
+
+function dbPostQuery(query,data,response) {
+    return new Promise((resolve,reject)=>{
+    DB.query(query,data,function(err, result) {
+        if (err) {
+                console.error(err);
+                reject(err)
+                response.send({ "status": "404" })
+            } else {
+                if(result.affectedRows >0){
+                    resolve(result);
+                }else{
+                    reject(err)
+                    response.send({ "status": "404" })
+                }
+                
+            }
+        }
+    )
+})
+}
+
+function dbSelectQuery(query,data,response) {
+    return new Promise((resolve,reject)=>{
+        DB.query(query,data,function(err, result) {
+            if (err) {
+                    console.error(err);
+                    reject(err)
+                        response.send({ "status": "404" })
+                } else {
+                    if(result.length > 0){
+                        resolve(result);
+                    }else{
+                        reject(err)
+                        response.send({ "status": "404" })
+                    }
+
+                }
+            }
+        )
+    })
+}
+
+function dbSelectCheckQuery(query,data,response) {
+    return new Promise((resolve,reject)=>{
+        DB.query(query,data,function(err, result) {
+            if (err) {
+                    console.error(err);
+                    reject(err)
+                        response.send({ "status": "404" })
+                } else {
+                        resolve(result);
+                }
+            }
+        )
+    })
+}
+
+const cashWithdrawCancel = async(request, response) => { //220919
+    console.log("1서버 캐쉬 출금 취소");
+    let memberId = getMemberId(request.get('Authorization'));
+    let cashList = request.body.cashList;
+    let cashListInfo,memberInfo;
+    cashListInfo = await dbSelectQuery('SELECT * FROM cashList WHERE cashList = ? AND cashState = 0 AND cashType = 1 AND memberId= ?',[cashList,memberId]);
+    memberInfo = await getMemberInfo(memberId);
+    dbPostQuery('UPDATE cashList SET cashState = 3 WHERE memberId = ? AND cashList = ?',[memberId,cashList]);
+    dbPostQuery('UPDATE member SET memberCash = memberCash + ? WHERE memberId = ?',[cashListInfo[0].cashAmount,memberId]);
+    let data = {
+        memberId: memberId,
+        cashHistoryType: 0,
+        cashHistoryAmount: cashListInfo[0].cashAmount,
+        cashHistoryDesc: "캐쉬출금 취소 완료",
+        cashHistoryMyCash: memberInfo[0].memberCash + cashListInfo[0].cashAmount
+    }
+    dbPostQuery('INSERT INTO cashHistory SET ?', data).then(()=>{response.send({ "status": "200" })})
+}
+
+//220810 JIN 수정
+
+const cashChargeCancel = async(request, response) => { //220919
+    console.log("1서버 캐시 충전 취소");
+    
+    let memberId = getMemberId(request.get('Authorization'));
+    let cashList = request.body.cashList;
+    console.log(cashList);
+    let cashListInfo,memberInfo;
+    cashListInfo = await dbSelectQuery('SELECT * FROM cashList WHERE memberId = ? AND cashState = 0 AND cashType = 0 AND cashList = ?',[memberId,cashList]);
+    memberInfo = await getMemberInfo(memberId);
+    dbPostQuery('UPDATE cashList SET cashState = 3 WHERE memberId = ? AND cashList = ?',[memberId,cashList])
+    .then(                                        
+        response.send({
+            "status": "200" //
+        })
+    )                               
+}
+
+const mypageCash = async(request, response) => { // 220524 //220919
+    let memberId = getMemberId(request.get('Authorization'));
+    let bank = request.body.bank;
+    let account = request.body.account;
+    let amount = request.body.amount;
+    let cashInfoType = request.body.cashInfoType;
+    let memberInfo,cashListCheck,smsChargeInfo;
+    let cashListInfo,cashListId
+    if(amount > 0){
+        memberInfo = await getMemberInfo(memberId);
+        cashListCheck = await dbSelectCheckQuery('SELECT * FROM cashList WHERE cashState = 0 AND memberId = ?', memberId);
+        if(cashListCheck.length == 0){
+            if (cashInfoType == 0) { //충전
+                var data = {
+                    memberId: memberId,
+                    cashType: 0,
+                    cashAmount: amount,
+                    memberName: memberInfo[0].memberName,
+                    memberNickname: memberInfo[0].memberNickname,
+                    memberPhone: memberInfo[0].memberPhone
+                } 
+                cashListInfo = await dbPostQuery('INSERT INTO cashList SET ?', data);
+                cashListId = cashListInfo.insertId;
+                // 입금 문자가 있는지 확인
+                smsChargeInfo = await dbSelectCheckQuery('SELECT * FROM chargeSms WHERE chargeState = 2 AND chargeCheck = 0 AND chargeName = ? AND chargeMoney = ? AND date(smsDate) >= date(subdate(now(), INTERVAL 1 DAY)) AND date(smsDate) <= date(now())',[memberInfo[0].memberName,amount])
+                if(smsChargeInfo.length == 1){
+                    console.log("입금 내역 확인")
+                    autoChargeApproval(request, response, cashListId, smsChargeInfo[0].smsList)
+                }else{
+                    console.log("충전 입금 내역 미확인, 데이터 저장 후 작동 완료")
+                    response.send({ "status": "200" })
+                }
+
+            } else if (cashInfoType == 1) { //출금
+                if (memberInfo[0].memberCash >= amount) {
+                    dbPostQuery('UPDATE member SET memberCash = memberCash - ? WHERE memberId = ?',[amount, memberId]);
+                    var data = {
+                        memberId: memberId,
+                        cashType: 1,
+                        cashAmount: amount,
+                        cashBank: bank,
+                        cashAccount: account,
+                        memberName: memberInfo[0].memberName,
+                        memberNickname: memberInfo[0].memberNickname,
+                        memberPhone: memberInfo[0].memberPhone
+                    }
+                    dbPostQuery('INSERT INTO cashList SET ?', data);
+                    data = {
+                        memberId: memberId,
+                        cashHistoryType: 1,
+                        cashHistoryAmount: amount,
+                        cashHistoryDesc: "출금신청 캐시 차감",
+                        cashHistoryMyCash: memberInfo[0].memberCash - amount
+                    }
+                    dbPostQuery('INSERT INTO cashHistory SET ?', data).then(response.send({ "status": "200" }))
+                }else{
+                    response.send({ "status": "201" })        
+                }
+            }
+        }else{
+            response.send({ "status": "202" })
+        }
+    }else{
+        response.send({ "status": "404" })
+    }
+}
+
+//220810 JIN 입금문자 수정
+const insertChargeSms = async(request, response) => {
+    //console.log(request.body.smsKey);
+    let smsmInfo = request.body.chargeInfo // orgin code
+    //let smsmInfo = request.body // test code
+    let chargeSmsId;
+    let chargeInfo;
+    let cashListInfo;
+    let smsSecret = 'Vq5n7r7RbmCwaxfU'
+    if (smsSecret != request.body.chargeInfo.smsKey) { // orgin code
+    //if (smsSecret != request.body.smsKey) { // test code
+        response.send({"status": "501"});
+        console.log("charge sms api secret error!!");
+    } else {
+        chargeInfo = await dbPostQuery('INSERT INTO chargeSms SET ?', request.body.chargeInfo); // orgin code
+        //chargeInfo = await dbPostQuery('INSERT INTO chargeSms SET ?', request.body); // test code
+        chargeSmsId = chargeInfo.insertId; 
+        cashListInfo = await dbSelectCheckQuery('SELECT * FROM cashList WHERE memberName = ? AND cashAmount= ? AND cashState = 0 AND cashType = 0 AND date(cashDate) >= date(subdate(now(), INTERVAL 2 DAY)) AND date(cashDate) <= date(now())',[smsmInfo.chargeName,smsmInfo.chargeMoney])
+        if(cashListInfo.length == 1){ // 1개가 정상 처리 됐을때
+            autoChargeApproval(request, response, cashListInfo[0].cashList, chargeSmsId)
+        }else if(cashListInfo.length > 1){
+            dbPostQuery('UPDATE chargeSms SET chargeState = 1 WHERE smsList= ?',chargeSmsId);
+            console.log("입금내역 저장 :" + request.body.chargeInfo.chargeName + " 금액 :" + request.body.chargeInfo.chargeMoney + " 내용 : 복수신청 및 동명이인 있을수 있음");
+            response.json({status: '200', msg: '신청내역 저장'});
+        }else{ // 입금 신청이 아직 안된경우 
+            dbPostQuery('UPDATE chargeSms SET chargeState = 2 WHERE smsList= ?',chargeSmsId);
+            console.log("입금내역 저장 :" + request.body.chargeInfo.chargeName + " 금액 :" + request.body.chargeInfo.chargeMoney + " 내용 : 충전신청 없음");
+            response.json({status: '200', msg: '신청내역 저장'});
+        }
+    }
+}
+
+//220810 JIN 자동충전 수정
+const autoChargeApproval = async(request, response, cashList, chargeSmsId) => {
+    console.log("자동 충전 실행");
+    let memberId;
+    let memberInfo;
+    let cashListInfo;
+    cashListInfo = await dbSelectQuery('SELECT * FROM cashList WHERE cashList = ?',cashList);
+    memberInfo = await getMemberInfo(cashListInfo[0].memberId);
+    memberId = cashListInfo[0].memberId;
+    cashAmount = cashListInfo[0].cashAmount;
+    memberName = cashListInfo[0].memberName;
+    dbPostQuery('UPDATE chargeSms SET chargeCheck = 1 WHERE smsList= ?',chargeSmsId);
+    dbPostQuery('UPDATE member SET memberCash = memberCash + ? WHERE memberId = ?',[cashAmount,memberId]);
+    dbPostQuery('UPDATE cashList SET cashState = 1 WHERE cashList = ?',cashList)
+    var data = {
+        memberId: memberId,
+        cashHistoryType: 0,
+        cashHistoryAmount: cashAmount,
+        cashHistoryDesc: "캐쉬 자동 충전",
+        cashHistoryMyCash: memberInfo[0].memberCash + cashAmount
+    }
+    dbPostQuery('INSERT INTO cashHistory SET ?', data).then(response.send({"status": "200"}))
+}
+
+const getMemberNameInfo = async (request, response) => {
+    let adminMemberId = await getMemberId(request.get('Authorization'));
+    let adminInfo = await getAdminMemberInfo(adminMemberId);
+    let memberNickname = request.body.memberNickname;
+    dbSelectQuery('SELECT * FROM member WHERE memberNickname = ?',memberNickname)
+    .then((result)=>{
+        response.json({
+            "status": '200', 
+            "result": result
+        })
+    })
+}
+const postMemberName = async (request, response) => {
+    let adminMemberId = await getMemberId(request.get('Authorization'));
+    let adminInfo = await getAdminMemberInfo(adminMemberId);
+    let memberName = request.body.memberName;
+    let memberId = request.body.memberId;
+    dbPostQuery('UPDATE member SET memberName = ?, memberNameCount = memberNameCount + 1 WHERE memberId = ?',[memberName,memberId])
+    .then((result)=>{
+        response.json({
+            "status": '200'
+        })
+    })
+}
+
+
+
+function getMemberId(header){
+    let token = header.split(' ')[1];
+    let decoded = jwt.decode(token);
+    return decoded.memberId
+}
+
+module.exports={
+    cashWithdrawCancel,
+    cashChargeCancel,
+    mypageCash,
+    insertChargeSms,
+    getMemberNameInfo,
+    postMemberName
+}
